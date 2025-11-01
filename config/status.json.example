@@ -1,0 +1,7 @@
+{
+  "target_repository": "org/my-gh-tasks",
+  "organizations": [
+    "github-organization-1",
+    "github-organization-2"
+  ]
+}
