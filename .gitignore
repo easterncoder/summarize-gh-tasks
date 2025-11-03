@@ -8,6 +8,7 @@ __pycache__/
 
 # Repository configuration
 config/status.json
+my-tasks/
 
 # Tooling caches
 .mypy_cache/

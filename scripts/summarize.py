@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Daily summarize workflow helper for Caseproof GitHub follow-ups.
+Daily summarize workflow helper for Caseproof follow-ups.
 
 On the first invocation each America/New_York day, this script generates a fresh
-todo checklist and opens (or updates) a GitHub issue titled
-`Todos for YYYY-MM-DD`. The issue body includes unfinished items from
-the previous checklist plus new action items collected via `gh` CLI queries.
-Subsequent invocations the same day simply display the already created issue.
+todo checklist and writes it to a Markdown file under the local `my-tasks`
+repository. Subsequent invocations the same day simply display the already
+created checklist. The file body includes unfinished items from the previous
+checklist plus new action items collected via `gh` CLI queries.
 """
 from __future__ import annotations
 
@@ -18,11 +18,9 @@ import re
 import subprocess
 import sys
 import textwrap
-import tempfile
 import uuid
 from datetime import datetime
 from pathlib import Path
-from functools import lru_cache
 from typing import Any, List, Sequence
 
 try:
@@ -33,6 +31,7 @@ except ImportError as exc:  # pragma: no cover
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TMP_ROOT = Path("/tmp/caseproof-summarize")
+TASKS_DIR = REPO_ROOT / "my-tasks"
 CONFIG_PATH = REPO_ROOT / "config/status.json"
 TODOS_TITLE_PREFIX = "Todos for "
 LEGACY_TODOS_PREFIXES = ("Caseproof Todos for ",)
@@ -92,11 +91,11 @@ class Query:
         return self.format_entry(item)[1]
 
 
-def load_configuration() -> tuple[tuple[str, ...], str]:
+def load_configuration() -> tuple[tuple[str, ...], str | None]:
     if not CONFIG_PATH.exists():
         raise SummarizeError(
             f"Missing configuration file at {CONFIG_PATH}. "
-            "Copy config/status.json.example and set `target_repository`."
+            "Copy config/status.json.example and configure the organizations list."
         )
     try:
         config_data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
@@ -131,29 +130,23 @@ def load_configuration() -> tuple[tuple[str, ...], str]:
                 f"`organizations` in {CONFIG_PATH} must be an array of strings."
             )
     raw_target_repo = config_data.get("target_repository")
-    if raw_target_repo is None:
-        raise SummarizeError(
-            f"`target_repository` must be specified in {CONFIG_PATH}."
-        )
-    if not isinstance(raw_target_repo, str):
-        raise SummarizeError(
-            f"`target_repository` in {CONFIG_PATH} must be a string."
-        )
-    target_repo_candidate = raw_target_repo.strip()
-    if not target_repo_candidate:
-        raise SummarizeError(
-            f"`target_repository` in {CONFIG_PATH} cannot be empty."
-        )
-    if "/" not in target_repo_candidate:
-        raise SummarizeError(
-            f"`target_repository` in {CONFIG_PATH} must be in the form `owner/repo`."
-        )
-    target_repo = target_repo_candidate
+    target_repo: str | None = None
+    if raw_target_repo is not None:
+        if not isinstance(raw_target_repo, str):
+            raise SummarizeError(
+                f"`target_repository` in {CONFIG_PATH} must be a string."
+            )
+        target_repo_candidate = raw_target_repo.strip()
+        if target_repo_candidate:
+            if "/" not in target_repo_candidate:
+                raise SummarizeError(
+                    f"`target_repository` in {CONFIG_PATH} must be in the form `owner/repo`."
+                )
+            target_repo = target_repo_candidate
     return organizations, target_repo
 
 
-ORG_NAMES, TARGET_REPOSITORY = load_configuration()
-GH_REPO_ARGS: tuple[str, ...] = ("--repo", TARGET_REPOSITORY)
+ORG_NAMES, _TARGET_REPOSITORY = load_configuration()
 
 
 def build_queries() -> List[Query]:
@@ -282,55 +275,8 @@ def run_query(query: Query) -> dict[str, list[dict[str, Any]]]:
     return aggregated
 
 
-def find_issue_by_title(title: str) -> dict[str, Any] | None:
-    result = run(
-        [
-            "gh",
-            "issue",
-            "list",
-            *GH_REPO_ARGS,
-            "--state",
-            "all",
-            "--limit",
-            "20",
-            "--json",
-            "number,title,body,url,createdAt,state",
-            "--search",
-            f"\"{title}\" in:title sort:created-desc",
-        ]
-    )
-    issues = json.loads(result.stdout)
-    for issue in issues:
-        if issue.get("title") == title:
-            return issue
-    return None
-
-
-def list_recent_todo_issues(limit: int = 5) -> list[dict[str, Any]]:
-    result = run(
-        [
-            "gh",
-            "issue",
-            "list",
-            *GH_REPO_ARGS,
-            "--state",
-            "all",
-            "--limit",
-            str(limit),
-            "--json",
-            "number,title,body,url,createdAt,state",
-            "--search",
-            "\"Todos\" in:title sort:created-desc",
-        ]
-    )
-    return json.loads(result.stdout)
-
-
 CHECKBOX_PATTERN = re.compile(r"^\s*[-*]\s*\[\s*([xX ])\s*\]\s*(.+)$")
 ITEM_URL_PATTERN = re.compile(r"https://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/")
-ISSUE_URL_PATTERN = re.compile(
-    r"https://github\.com/(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+)/issues/(?P<number>\d+)"
-)
 GITHUB_URL_PATTERN = re.compile(r"https://github\.com/[^\s)]+")
 REPO_REF_PATTERN = re.compile(r"([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+#[0-9]+)")
 
@@ -392,7 +338,7 @@ def extract_unfinished_items(issue_body: str | None) -> list[str]:
     return carryover
 
 
-def compose_issue_body(
+def compose_checklist_body(
     today_str: str,
     now_utc: datetime,
     carryover: list[str],
@@ -471,151 +417,61 @@ def collect_sections_by_org() -> dict[str, list[tuple[Query, list[tuple[str, str
     return sections
 
 
-def write_issue_body_to_tmp(body: str) -> Path:
-    ensure_tmp_dir()
-    tmp_file = tempfile.NamedTemporaryFile(
-        mode="w",
-        encoding="utf-8",
-        delete=False,
-        dir=TMP_ROOT,
-        suffix=".md",
-    )
-    with tmp_file:
-        tmp_file.write(body)
-    return Path(tmp_file.name)
+CHECKLIST_FILENAME_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}\.md$")
 
 
-def extract_issue_reference(output: str) -> dict[str, Any] | None:
-    for line in output.splitlines():
-        match = ISSUE_URL_PATTERN.search(line.strip())
-        if match:
-            url = match.group(0)
-            try:
-                number = int(match.group("number"))
-            except (TypeError, ValueError) as exc:  # pragma: no cover
-                raise SummarizeError(
-                    f"Unexpected issue number in gh output: {match.group('number')}"
-                ) from exc
-            return {"number": number, "url": url}
+def ensure_tasks_dir() -> Path:
+    TASKS_DIR.mkdir(parents=True, exist_ok=True)
+    return TASKS_DIR
+
+
+def list_checklist_files() -> list[Path]:
+    if not TASKS_DIR.exists():
+        return []
+    files = [
+        path
+        for path in TASKS_DIR.iterdir()
+        if path.is_file() and CHECKLIST_FILENAME_PATTERN.match(path.name)
+    ]
+    return sorted(files)
+
+
+def find_previous_checklist(today_filename: str) -> Path | None:
+    for path in reversed(list_checklist_files()):
+        if path.name < today_filename:
+            return path
     return None
 
 
-@lru_cache(maxsize=1)
-def get_repo_html_base() -> str:
-    if TARGET_REPOSITORY:
-        return f"https://github.com/{TARGET_REPOSITORY.strip('/')}"
-    result = run(["git", "remote", "get-url", "origin"])
-    remote = result.stdout.strip()
-    if remote.startswith("git@github.com:"):
-        path = remote.split(":", 1)[1]
-    elif remote.startswith("https://github.com/"):
-        path = remote.split("https://github.com/", 1)[1]
-    elif remote.startswith("ssh://git@github.com/"):
-        path = remote.split("ssh://git@github.com/", 1)[1]
-    else:  # pragma: no cover
-        raise SummarizeError(
-            f"Unsupported remote URL format for origin: {remote or '<empty>'}"
-        )
-    if path.endswith(".git"):
-        path = path[:-4]
-    if not path or "/" not in path:
-        raise SummarizeError(f"Unable to parse GitHub owner/repo from remote: {remote}")
-    return f"https://github.com/{path.strip('/')}"
+def find_latest_checklist() -> Path | None:
+    files = list_checklist_files()
+    return files[-1] if files else None
 
 
-def build_issue_url(number: int) -> str:
-    base = get_repo_html_base()
-    return f"{base}/issues/{number}"
-
-
-def create_issue(title: str, body: str) -> dict[str, Any]:
-    body_path = write_issue_body_to_tmp(body)
-    try:
-        result = run(
-            [
-                "gh",
-                "issue",
-                "create",
-                *GH_REPO_ARGS,
-                "--title",
-                title,
-                "--body-file",
-                str(body_path),
-            ]
-        )
-    finally:
-        body_path.unlink(missing_ok=True)
-    reference = extract_issue_reference(result.stdout)
-    if not reference:
-        raise SummarizeError(
-            "gh issue create succeeded but did not return an issue URL. "
-            "Please update the GitHub CLI to a recent version."
-        )
-    return reference
-
-
-def update_issue(number: int, title: str, body: str) -> dict[str, Any]:
-    body_path = write_issue_body_to_tmp(body)
-    try:
-        result = run(
-            [
-                "gh",
-                "issue",
-                "edit",
-                str(number),
-                *GH_REPO_ARGS,
-                "--title",
-                title,
-                "--body-file",
-                str(body_path),
-            ]
-        )
-    finally:
-        body_path.unlink(missing_ok=True)
-    reference = extract_issue_reference(result.stdout)
-    if not reference:
-        return {"number": number, "url": build_issue_url(number)}
-    return reference
-
-
-def close_issue(number: int, *, new_issue_url: str | None = None) -> None:
-    cmd = ["gh", "issue", "close", str(number)]
-    cmd.extend(GH_REPO_ARGS)
-    if new_issue_url:
-        cmd.extend(["--comment", f"Superseded by {new_issue_url}"])
-    run(cmd)
-
-
-def reopen_issue(number: int) -> None:
-    cmd = ["gh", "issue", "reopen", str(number)]
-    cmd.extend(GH_REPO_ARGS)
-    run(cmd)
-
-
-def show_issue(issue: dict[str, Any]) -> None:
-    print(f"{issue['title']} — {issue['url']}")
+def show_checklist(path: Path) -> None:
+    print(f"{path.name} — {path.resolve()}")
     print("")
-    print(issue.get("body") or "")
+    print(path.read_text(encoding="utf-8"))
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Caseproof daily GitHub summary automation."
+        description="Caseproof daily checklist generator."
     )
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Regenerate the checklist even if today's issue already exists.",
+        help="Regenerate the checklist even if today's Markdown file already exists.",
     )
     parser.add_argument(
         "--show",
         action="store_true",
-        help="Display the current daily issue without modifying anything.",
+        help="Display the current daily checklist without modifying anything.",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Generate the checklist and print the would-be issue body without creating or updating an issue.",
+        help="Generate the checklist and print the would-be Markdown without writing a file.",
     )
     return parser.parse_args()
 
@@ -630,84 +486,62 @@ def main() -> int:
     now_utc = datetime.now(tz=ZoneInfo("UTC"))
     now_ny = now_utc.astimezone(timezone)
     today_str = now_ny.date().isoformat()
-    today_title = f"{TODOS_TITLE_PREFIX}{today_str}"
-
-    existing_today = find_issue_by_title(today_title)
+    today_filename = f"{today_str}.md"
+    today_path = TASKS_DIR / today_filename
+    existing_today = today_path if today_path.exists() else None
 
     if args.show and existing_today:
-        show_issue(existing_today)
+        show_checklist(today_path)
         return 0
     if args.show and not existing_today:
-        issues = list_recent_todo_issues(limit=1)
-        if not issues:
-            raise SummarizeError("No Todos issues exist yet.")
-        print("Today's issue not found; showing the most recent entry instead:\n")
-        show_issue(issues[0])
+        fallback = find_latest_checklist()
+        if not fallback:
+            raise SummarizeError("No Todos checklists exist yet.")
+        print("Today's checklist not found; showing the most recent entry instead:\n")
+        show_checklist(fallback)
         return 0
 
     if existing_today and not args.force:
         print(
             textwrap.dedent(
                 """
-                Today's checklist already exists (detected `Todos` issue for the current America/New_York day).
-                Showing the current issue body instead of regenerating.
+                Today's checklist already exists (found local Markdown file for the current America/New_York day).
+                Showing the current file instead of regenerating.
                 """
             ).strip()
         )
-        show_issue(existing_today)
+        show_checklist(today_path)
         return 0
 
-    recent_issues = list_recent_todo_issues(limit=10)
-
-    if not existing_today:
-        for issue in recent_issues:
-            if issue.get("title") == today_title:
-                existing_today = issue
-                break
-
-    previous_issue = None
-    for issue in recent_issues:
-        if existing_today and issue["number"] == existing_today["number"]:
-            continue
-        if any(issue["title"].startswith(prefix) for prefix in ALL_TODO_PREFIXES):
-            previous_issue = issue
-            break
-
     if args.force and existing_today:
-        carryover_source = existing_today.get("body")
+        carryover_source = today_path.read_text(encoding="utf-8")
     else:
-        carryover_source = (previous_issue or {}).get("body")
+        previous_path = find_previous_checklist(today_filename)
+        carryover_source = (
+            previous_path.read_text(encoding="utf-8") if previous_path else None
+        )
     carryover = extract_unfinished_items(carryover_source)
 
     sections_by_org = collect_sections_by_org()
-    body = compose_issue_body(today_str, now_utc, carryover, sections_by_org)
+    body = compose_checklist_body(today_str, now_utc, carryover, sections_by_org)
 
     if args.dry_run:
-        print(today_title)
-        print("=" * len(today_title))
+        print(today_filename)
+        print("=" * len(today_filename))
         print(body)
         return 0
 
+    ensure_tasks_dir()
     if args.force and existing_today:
-        updated = update_issue(existing_today["number"], today_title, body)
-        reopened = False
-        if (existing_today.get("state") or "").upper() != "OPEN":
-            reopen_issue(existing_today["number"])
-            reopened = True
-        status_text = "Issue updated"
-        if reopened:
-            status_text += " and reopened"
-        print(f"{status_text}: {updated['url']}")
+        today_path.write_text(body, encoding="utf-8")
+        print(f"Checklist regenerated at {today_path}")
         return 0
 
-    created = create_issue(today_title, body)
-    if previous_issue and (previous_issue.get("state") or "").upper() == "OPEN":
-        close_issue(previous_issue["number"], new_issue_url=created["url"])
-        print(
-            f"Closed previous issue #{previous_issue['number']} and created: {created['url']}"
-        )
+    today_path.write_text(body, encoding="utf-8")
+    if find_previous_checklist(today_filename):
+        print(f"Checklist written to {today_path} (carryover items preserved).")
     else:
-        print(f"Issue created: {created['url']}")
+        print(f"Checklist written to {today_path}.")
     return 0
 
 
