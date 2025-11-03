@@ -186,7 +186,7 @@ def build_queries() -> List[Query]:
                 "--state",
                 "open",
                 "--json",
-                "number,title,url,repository",
+                "number,title,url,repository,isDraft",
                 "--limit",
                 "50",
             ],
@@ -207,7 +207,7 @@ def build_queries() -> List[Query]:
                 "--state",
                 "open",
                 "--json",
-                "number,title,url,repository",
+                "number,title,url,repository,isDraft",
                 "--limit",
                 "50",
             ],
@@ -262,6 +262,8 @@ def run_query(query: Query) -> dict[str, list[dict[str, Any]]]:
                 f"{type(data).__name__}"
             )
         for item in data:
+            if item.get("isDraft"):
+                continue
             if is_automation_issue(item):
                 continue
             url = item.get("url")
