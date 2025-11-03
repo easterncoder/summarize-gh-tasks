@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [2.0.0] - 2024-11-02
+
+### Changed
+- Store daily todos as Markdown files under a local `my-tasks/` repository instead of publishing GitHub issues.
+- Treat `target_repository` as optional configuration while keeping organization lookups intact.
+- Refresh operator documentation to describe the local-storage workflow and setup.
+
+### Fixed
+- Exclude draft pull requests from review and authored sections when generating the checklist.
+
 ## [1.0.0] - 2024-11-02
 
 ### Added
